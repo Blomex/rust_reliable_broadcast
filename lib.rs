@@ -468,9 +468,10 @@ pub mod executors_public {
     use std::ops::{DerefMut, Add};
     use std::thread::{JoinHandle, spawn, sleep};
     use uuid::Uuid;
-    use std::collections::{HashMap, BinaryHeap};
+    use std::collections::{HashMap, BinaryHeap, HashSet};
     use std::cmp::{Ordering};
     use std::any::Any;
+    use std::borrow::Borrow;
 
     pub trait Message: fmt::Debug + Clone + Send + 'static {}
     impl<T: fmt::Debug + Clone + Send + 'static> Message for T {}
@@ -487,15 +488,16 @@ pub mod executors_public {
     pub struct Tick {}
 
     pub struct System {
-        reliable_broadcasts: HashMap<Uuid, ModuleRef<ReliableBroadcastModule>>,
         tick: Option<JoinHandle<()>>,
         executor: Option<JoinHandle<()>>,
+        modules: HashSet<Uuid>,
         tick_handler: Arc<(Mutex<BinaryHeap<Ticker>>, Condvar)>,
         pub(crate) meta_tx: crossbeam_channel::Sender<WorkerMsg>,
         starting_time: Instant,
     }
 
     struct Ticker{
+        uuid: Uuid,
         next_time: Duration,
         tick_duration: Duration,
         tick_ref: Arc<Mutex<dyn std::marker::Send + Handler<Tick>>>,
@@ -520,7 +522,7 @@ pub mod executors_public {
         }
     }
     pub(crate) enum WorkerMsg {
-        NewModule(Uuid, ModuleRef<ReliableBroadcastModule>),
+        NewModule(Uuid),
         /// When all references to a module are dropped, the module ought to be
         /// removed too. Otherwise, there is a possibility of a memory leak.
         RemoveModule(Uuid),
@@ -534,7 +536,8 @@ pub mod executors_public {
             let dummy_ticker = tick_mutex.deref_mut();
             let current_time = Instant::now();
             let ticker = Ticker{
-                tick_ref: requester.clone().module,
+                uuid: requester.uuid,
+                tick_ref: requester.module.clone(),
                 tick_duration: delay,
                 next_time: current_time.duration_since(self.starting_time) + delay,
             };
@@ -544,7 +547,10 @@ pub mod executors_public {
         }
 
         pub fn register_module<T: Send + 'static>(&mut self, module: T) -> ModuleRef<T> {
-                 ModuleRef{
+            let uuid = Uuid::new_v4();
+            self.meta_tx.send(WorkerMsg::NewModule(uuid));
+            ModuleRef{
+                     uuid,
                     module: Arc::new(Mutex::new(module)),
                     meta_queue: self.meta_tx.clone(),
                 }
@@ -553,26 +559,43 @@ pub mod executors_public {
         pub fn new() -> Self {
             let (meta_tx, meta_rx):  (Sender<WorkerMsg>, Receiver<WorkerMsg>) = unbounded();
             let now_timer = Instant::now();
+            let mut modules = HashSet::new();
+            let mut cloned_modules = modules.clone();
             let mut system =  System{
                 tick: None,
                 executor: None,
+                modules,
                 tick_handler: Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new())),
                 meta_tx,
-                reliable_broadcasts: HashMap::new(),
                 starting_time: now_timer,
 
             };
             let cloned_tick_handler = system.tick_handler.clone();
-            let mut reliable_broadcasts = system.reliable_broadcasts.clone();
+            let cloned_tick_handler2 = system.tick_handler.clone();
             system.executor = Option::from(spawn(move || {
                 while let Ok(msg) = meta_rx.recv(){
                     match msg{
-                        WorkerMsg::NewModule(uuid, moduleref) => {
-                            println!("Inside Newmodule");
-                            reliable_broadcasts.insert(uuid, moduleref);
+                        WorkerMsg::NewModule(uuid) => {
+                            println!("new module {}", uuid);
+                            cloned_modules.insert(uuid);
                         },
                         WorkerMsg::RemoveModule(uuid) =>{
-                            reliable_broadcasts.remove(&uuid);
+                            println!("removing module {}", uuid);
+                            cloned_modules.remove(&uuid);
+                            //find 'ticker'
+                            let (mutex, cond) = &*cloned_tick_handler2;
+                            let mut guard = mutex.lock().unwrap();
+                            let heap = guard.deref_mut();
+                            let mut new_heap = BinaryHeap::new();
+                            while !heap.is_empty(){
+                                let ticker = heap.pop().unwrap();
+                                if ticker.uuid != uuid{
+                                    new_heap.push(ticker);
+                                }
+                            }
+                            for item in new_heap{
+                                heap.push(item);
+                            }
                         },
                         WorkerMsg::ExecuteModule(closure) => {
                             closure();
@@ -629,12 +652,13 @@ pub mod executors_public {
     }
     impl Drop for System{
         fn drop(&mut self) {
-            self.tick.take().unwrap().join();
-            self.executor.take().unwrap().join();
+           // self.tick.take().unwrap().join();
+           // self.executor.take().unwrap().join();
         }
     }
 
     pub struct ModuleRef<T: Send + 'static> {
+        uuid: Uuid,
         module : Arc<Mutex<T>>,
         meta_queue: Sender<WorkerMsg>,
     }
@@ -653,11 +677,11 @@ pub mod executors_public {
                     }))).ok();
         }
     }
-    // impl<T: Send> Drop for ModuleRef<T>{
-    //     fn drop(&mut self) {
-    //         self.meta_queue.send(WorkerMsg::RemoveModule(self.id));
-    //     }
-    // }
+    impl<T: Send> Drop for ModuleRef<T>{
+        fn drop(&mut self) {
+            self.meta_queue.send(WorkerMsg::RemoveModule(self.uuid));
+        }
+    }
     impl<T: Send> fmt::Debug for ModuleRef<T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
             f.write_str("<ModuleRef>")
@@ -666,6 +690,7 @@ pub mod executors_public {
     impl<T: Send> Clone for ModuleRef<T> {
         fn clone(&self) -> Self {
             ModuleRef{
+                uuid: self.uuid,
                 module: self.module.clone(),
                 meta_queue: self.meta_queue.clone(),
             }
@@ -696,7 +721,6 @@ pub mod system_setup_public {
 
         let rbm = ReliableBroadcastModule{reliable_broadcast: dyn_rel_broadcast};
         let rbm_ref = system.register_module(rbm);
-        system.meta_tx.send(WorkerMsg::NewModule(config.self_process_identifier, rbm_ref.clone())).expect("message couldn't be send");
         system.request_tick(&sbeb_ref, config.retransmission_delay);
         return rbm_ref;
 
