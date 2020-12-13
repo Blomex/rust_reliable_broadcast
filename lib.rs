@@ -6,7 +6,6 @@ pub use crate::executors_public::*;
 pub use crate::stable_storage_public::*;
 pub use crate::system_setup_public::*;
 pub use domain::*;
-use std::panic;
 type ClosureMsg = Box<dyn Fn() -> () + Send>;
 pub mod broadcast_public {
     use crate::executors_public::ModuleRef;
@@ -41,7 +40,7 @@ pub mod broadcast_public {
         while storage.get(&currently_analyzed).is_some(){
             let message = MyReliableBroadcast::decode_system_broadcast_message(
                 storage.get(&currently_analyzed).unwrap().as_slice());
-            let header = message.message.header.clone();
+            let header = message.message.header;
             pending.insert(header, message);
             counter +=1;
             currently_analyzed = "pending".to_owned() + &counter.to_string();
@@ -99,7 +98,6 @@ pub mod broadcast_public {
         counter : i64,
         delivered_counter: i64,
         ack_counter: i64,
-
     }
     impl MyReliableBroadcast{
         fn parse_header(header: SystemMessageHeader) -> Vec<u8>{
@@ -111,11 +109,11 @@ pub mod broadcast_public {
         fn parse_system_message_content(msg: SystemMessageContent) ->Vec<u8>{
             msg.msg
         }
-        fn parse_system_ack_message(ack_msg: SystemAcknowledgmentMessage) -> Vec<u8>{
-            let parsed_header = MyReliableBroadcast::parse_header(ack_msg.hdr);
-            let parse_sender_uuid = ack_msg.proc.as_bytes().to_vec();
-            [parse_sender_uuid, parsed_header].concat()
-        }
+        // fn parse_system_ack_message(ack_msg: SystemAcknowledgmentMessage) -> Vec<u8>{
+        //     let parsed_header = MyReliableBroadcast::parse_header(ack_msg.hdr);
+        //     let parse_sender_uuid = ack_msg.proc.as_bytes().to_vec();
+        //     [parse_sender_uuid, parsed_header].concat()
+        // }
         fn parse_system_message(msg: SystemMessage) -> Vec<u8>{
             let header = MyReliableBroadcast::parse_header(msg.header);
             let content = MyReliableBroadcast::parse_system_message_content(msg.data);
@@ -168,7 +166,7 @@ pub mod broadcast_public {
             };
             let message = SystemMessage{
                 header,
-                data: msg.clone(),
+                data: msg,
             };
             let broadcast_msg = SystemBroadcastMessage{
                 forwarder_id: self.id,
@@ -177,7 +175,7 @@ pub mod broadcast_public {
             self.pending.insert(header, broadcast_msg.clone());
             let encoded_message = MyReliableBroadcast::parse_system_broadcast_message(broadcast_msg.clone());
             let pending_messages = "pending".to_owned() + &self.counter.to_string();
-            self.counter = self.counter +1;
+            self.counter += 1;
             self.storage.put(&*pending_messages, encoded_message.as_slice()).unwrap_or(());
             self.sbeb.send(broadcast_msg)
         }
@@ -251,15 +249,15 @@ pub mod broadcast_public {
     impl StubbornBroadcast for MyStubbornBroadcast {
 
         fn broadcast(&mut self, msg: SystemBroadcastMessage) {
-            self.messages.insert(msg.message.header.clone(), msg.clone());
+            self.messages.insert(msg.message.header, msg.clone());
             let new_set = self.processes.clone();
-            self.pending.insert(msg.message.header.clone(), new_set);
+            self.pending.insert(msg.message.header, new_set);
             self.tick();
         }
 
         fn receive_acknowledgment(&mut self, proc: Uuid, msg: SystemMessageHeader) {
-            let mut pending_set = self.pending.get(&msg).cloned();
-            match pending_set.clone(){
+            let pending_set = self.pending.get(&msg).cloned();
+            match pending_set{
                 None => return,
                 Some(mut set) => {
                     if set.contains(&proc){
@@ -274,7 +272,7 @@ pub mod broadcast_public {
         }
 
         fn send_acknowledgment(&mut self, proc: Uuid, msg: SystemAcknowledgmentMessage) {
-            self.link.send_to(&proc, PlainSenderMessage::Acknowledge(msg.clone()));
+            self.link.send_to(&proc, PlainSenderMessage::Acknowledge(msg));
         }
 
         fn tick(&mut self) {
@@ -308,7 +306,7 @@ pub mod broadcast_public {
 
 pub mod stable_storage_public {
     use std::path::PathBuf;
-    use std::fs::{File, create_dir, DirEntry, create_dir_all};
+    use std::fs::{File, create_dir_all};
     use std::io::{Read, Write};
 
     pub trait StableStorage: Send {
@@ -414,7 +412,7 @@ pub mod stable_storage_public {
                 path.push( &*encoded_key);
             }
             print!("Path when PUSHING: {:#?}\n", path);
-            match File::create(path.clone()){
+            match File::create(path){
                 Ok(mut file) => {
                     match file.write_all(value) {
                         Ok(_) => return Ok(()),
@@ -460,18 +458,17 @@ pub mod stable_storage_public {
 }
 
 pub mod executors_public {
-    use std::{fmt, panic};
-    use std::time::{Duration, SystemTime, Instant};
+    use std::{fmt};
+    use std::time::{Duration, Instant};
     use crossbeam_channel::{unbounded, Receiver, Sender};
-    use crate::{ClosureMsg, ReliableBroadcastModule};
+    use crate::{ClosureMsg};
     use std::sync::{Arc, Mutex, Condvar};
-    use std::ops::{DerefMut, Add};
-    use std::thread::{JoinHandle, spawn, sleep};
+    use std::ops::{DerefMut, Deref};
+    use std::thread::{JoinHandle, spawn};
     use uuid::Uuid;
-    use std::collections::{HashMap, BinaryHeap, HashSet};
+    use std::collections::{BinaryHeap};
     use std::cmp::{Ordering};
-    use std::any::Any;
-    use std::borrow::Borrow;
+    use std::sync::atomic::AtomicBool;
 
     pub trait Message: fmt::Debug + Clone + Send + 'static {}
     impl<T: fmt::Debug + Clone + Send + 'static> Message for T {}
@@ -490,14 +487,14 @@ pub mod executors_public {
     pub struct System {
         tick: Option<JoinHandle<()>>,
         executor: Option<JoinHandle<()>>,
-        modules: HashSet<Uuid>,
         tick_handler: Arc<(Mutex<BinaryHeap<Ticker>>, Condvar)>,
         pub(crate) meta_tx: crossbeam_channel::Sender<WorkerMsg>,
         starting_time: Instant,
+        done: Arc<Mutex<bool>>,
     }
 
     struct Ticker{
-        uuid: Uuid,
+      //  uuid: Uuid,
         next_time: Duration,
         tick_duration: Duration,
         tick_ref: Arc<Mutex<dyn std::marker::Send + Handler<Tick>>>,
@@ -526,6 +523,7 @@ pub mod executors_public {
         /// When all references to a module are dropped, the module ought to be
         /// removed too. Otherwise, there is a possibility of a memory leak.
         RemoveModule(Uuid),
+        ExecutionDone,
         /// This message could be used to notify the system, that there is a message
         /// to be deliver to the specified module.
         ExecuteModule(ClosureMsg),
@@ -536,7 +534,7 @@ pub mod executors_public {
             let dummy_ticker = tick_mutex.deref_mut();
             let current_time = Instant::now();
             let ticker = Ticker{
-                uuid: requester.uuid,
+             //  uuid: requester.uuid,
                 tick_ref: requester.module.clone(),
                 tick_duration: delay,
                 next_time: current_time.duration_since(self.starting_time) + delay,
@@ -548,9 +546,9 @@ pub mod executors_public {
 
         pub fn register_module<T: Send + 'static>(&mut self, module: T) -> ModuleRef<T> {
             let uuid = Uuid::new_v4();
-            self.meta_tx.send(WorkerMsg::NewModule(uuid));
+            self.meta_tx.send(WorkerMsg::NewModule(uuid)).unwrap_or(());
             ModuleRef{
-                     uuid,
+                    // uuid,
                     module: Arc::new(Mutex::new(module)),
                     meta_queue: self.meta_tx.clone(),
                 }
@@ -559,66 +557,76 @@ pub mod executors_public {
         pub fn new() -> Self {
             let (meta_tx, meta_rx):  (Sender<WorkerMsg>, Receiver<WorkerMsg>) = unbounded();
             let now_timer = Instant::now();
-            let mut modules = HashSet::new();
-            let mut cloned_modules = modules.clone();
-            let mut system =  System{
-                tick: None,
-                executor: None,
-                modules,
-                tick_handler: Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new())),
-                meta_tx,
-                starting_time: now_timer,
+            let done = Arc::new(Mutex::new(false));
+            let tick_handler : Arc<(Mutex<BinaryHeap<Ticker>>, Condvar)> =
+                Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new()));
 
-            };
-            let cloned_tick_handler = system.tick_handler.clone();
-            let cloned_tick_handler2 = system.tick_handler.clone();
-            system.executor = Option::from(spawn(move || {
+            // let mut system =  System{
+            //     tick: None,
+            //     executor: None,
+            //     tick_handler: Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new())),
+            //     meta_tx,
+            //     starting_time: now_timer,
+            //     done: Arc::new(Mutex::new(false)),
+            // };
+            let cloned_tick_handler = tick_handler.clone();
+            //let cloned_tick_handler2 = system.tick_handler.clone();
+            let cloned_done = done.clone();
+            /*system.executor = Option::from(spawn(move || {
+                let cloned_done = cloned_done.clone();
                 while let Ok(msg) = meta_rx.recv(){
                     match msg{
                         WorkerMsg::NewModule(uuid) => {
                             println!("new module {}", uuid);
-                            cloned_modules.insert(uuid);
+                            // cloned_modules.insert(uuid);
                         },
-                        WorkerMsg::RemoveModule(uuid) =>{
-                            println!("removing module {}", uuid);
-                            cloned_modules.remove(&uuid);
-                            //find 'ticker'
-                            let (mutex, cond) = &*cloned_tick_handler2;
-                            let mut guard = mutex.lock().unwrap();
-                            let heap = guard.deref_mut();
-                            let mut new_heap = BinaryHeap::new();
-                            while !heap.is_empty(){
-                                let ticker = heap.pop().unwrap();
-                                if ticker.uuid != uuid{
-                                    new_heap.push(ticker);
-                                }
-                            }
-                            for item in new_heap{
-                                heap.push(item);
-                            }
+                        WorkerMsg::RemoveModule(_uuid) =>{
+                            // println!("removing module {}", uuid);
+                            // cloned_modules.remove(&uuid);
+                            // //find 'ticker'
+                            // let (mutex, cond) = &*cloned_tick_handler2;
+                            // let mut guard = mutex.lock().unwrap();
+                            // let heap = guard.deref_mut();
+                            // let mut new_heap = BinaryHeap::new();
+                            // while !heap.is_empty(){
+                            //     let ticker = heap.pop().unwrap();
+                            //     if ticker.uuid != uuid{
+                            //         new_heap.push(ticker);
+                            //     }
+                            // }
+                            // for item in new_heap{
+                            //     heap.push(item);
+                            // }
                         },
                         WorkerMsg::ExecuteModule(closure) => {
                             closure();
                         }
                     }
+                    let mut done_lock = cloned_done.lock().unwrap();
+                    let guard = done_lock.deref_mut();
+                    if *guard == true {
+                        println!("Executor is ending");
+                        return;
+                    }
 
                 }
                 print!("executor thread exiting..\n");
-            }));
-            let now = now_timer.clone();
-            system.tick = Option::from(spawn(move || {
+            }));*/
+            let now = now_timer;
+            /*system.tick = Option::from(spawn(move || {
+                let done = cloned_done.clone();
                 let mut time = Duration::from_secs(0);
-                let predicate = Box::new(|var: &mut BinaryHeap<Ticker>, mut time: Duration|{
+                let predicate = Box::new(|var: &mut BinaryHeap<Ticker>, time: &mut Duration|{
                     if !var.is_empty() {
                         let current_time = Instant::now();
-                        let mut shortest_time = var.peek().unwrap();
+                        let shortest_time = var.peek().unwrap();
                         let elapsed = current_time.duration_since(now);
                         if elapsed.gt(&shortest_time.next_time){
                             println!("dur: {:#?}", current_time.duration_since(now));
                             return true;
                         }
                         else {
-                            time = shortest_time.next_time - elapsed;
+                            *time = shortest_time.next_time - elapsed;
                         }
                         return false;
                     }
@@ -627,7 +635,7 @@ pub mod executors_public {
                 let (mutex, cond) = &*cloned_tick_handler;
                 loop {
                     let mut guard = mutex.lock().unwrap();
-                    while !predicate(guard.deref_mut(), time) {
+                    while !predicate(guard.deref_mut(), &mut time) {
                         guard = cond.wait_timeout(guard, time).unwrap().0;
                       //  println!("keep waiting")
                     }
@@ -641,24 +649,126 @@ pub mod executors_public {
                     println!("Tick requested! {:#?} {:#?}", first_module.next_time, first_module.tick_duration);
                     module_handler.handle(Tick {});
                     drop(module_mutex);
-                    first_module.next_time = first_module.next_time + first_module.tick_duration;
+                    first_module.next_time += first_module.tick_duration;
                     ticker.push(first_module);
                         drop(guard);
+                    let mut done_lock = done.lock().unwrap();
+                    let guard = done_lock.deref_mut();
+                    if *guard == true {
+                        println!("Tick is ending");
+                        return;
+                    }
                 }
 
-            }));
-            return system;
+            }));*/
+
+            System{
+                tick: Option::from(spawn(move || {
+                    let done = cloned_done.clone();
+                    let mut time = Duration::from_secs(1);
+                    let predicate = Box::new(|var: &mut BinaryHeap<Ticker>, time: &mut Duration|{
+                        if !var.is_empty() {
+                            let current_time = Instant::now();
+                            let shortest_time = var.peek().unwrap();
+                            let elapsed = current_time.duration_since(now);
+                            if elapsed.gt(&shortest_time.next_time){
+                                println!("dur: {:#?}", current_time.duration_since(now));
+                                return true;
+                            }
+                            else {
+                                *time = shortest_time.next_time - elapsed;
+                            }
+                            return false;
+                        }
+                        return false;
+                    });
+                    let (mutex, cond) = &*cloned_tick_handler;
+                    loop {
+
+                        let mut guard = mutex.lock().unwrap();
+                        while !predicate(guard.deref_mut(), &mut time) {
+                         //   println!("Checking tick");
+                            guard = cond.wait_timeout(guard, time).unwrap().0;
+                            let mut done_lock = done.lock().unwrap();
+                            let guard = done_lock.deref_mut();
+                            println!("guard is {:#?}", guard);
+                            if *guard == true {
+                                println!("Tick is ending");
+                                return;
+                            }
+                            //  println!("keep waiting")
+                        }
+
+                        // let start_time = SystemTime::now();
+                        let ticker = guard.deref_mut();
+                        let mut first_module = ticker.pop().unwrap();
+                        //Trying to pick up module mutex
+                        let mut module_mutex = first_module.tick_ref.lock().unwrap();
+                        let module_handler = module_mutex.deref_mut();
+                        println!("Tick requested! {:#?} {:#?}", first_module.next_time, first_module.tick_duration);
+                        module_handler.handle(Tick {});
+                        drop(module_mutex);
+                        first_module.next_time += first_module.tick_duration;
+                        ticker.push(first_module);
+                        drop(guard);
+                    }
+
+                })),
+                executor: Option::from(spawn(move || {
+                    while let Ok(msg) = meta_rx.recv(){
+                        match msg{
+                            WorkerMsg::NewModule(uuid) => {
+                                println!("new module {}", uuid);
+                                // cloned_modules.insert(uuid);
+                            },
+                            WorkerMsg::RemoveModule(_uuid) =>{
+                                // println!("removing module {}", uuid);
+                                // cloned_modules.remove(&uuid);
+                                // //find 'ticker'
+                                // let (mutex, cond) = &*cloned_tick_handler2;
+                                // let mut guard = mutex.lock().unwrap();
+                                // let heap = guard.deref_mut();
+                                // let mut new_heap = BinaryHeap::new();
+                                // while !heap.is_empty(){
+                                //     let ticker = heap.pop().unwrap();
+                                //     if ticker.uuid != uuid{
+                                //         new_heap.push(ticker);
+                                //     }
+                                // }
+                                // for item in new_heap{
+                                //     heap.push(item);
+                                // }
+                            },
+                            WorkerMsg::ExecuteModule(closure) => {
+                                closure();
+                            },
+                            _ => return,
+                        }
+                        println!("after msg");
+
+                    }
+                    print!("executor thread exiting..\n");
+                })),
+                tick_handler: Arc::new((Mutex::new(Default::default()), Default::default())),
+                meta_tx,
+                starting_time: now_timer,
+                done: done
+            }
         }
     }
     impl Drop for System{
         fn drop(&mut self) {
-           // self.tick.take().unwrap().join();
-           // self.executor.take().unwrap().join();
+            println!("Trying to get done mutex");
+            *self.done.lock().unwrap().deref_mut() = true;
+            println!("Telling all threads to end");
+            self.meta_tx.send(WorkerMsg::ExecutionDone);
+            self.tick.take().unwrap().join().unwrap_or(());
+            self.executor.take().unwrap().join().unwrap_or(());
         }
     }
 
     pub struct ModuleRef<T: Send + 'static> {
-        uuid: Uuid,
+       // uuid: Uuid,
         module : Arc<Mutex<T>>,
         meta_queue: Sender<WorkerMsg>,
     }
@@ -679,7 +789,7 @@ pub mod executors_public {
     }
     impl<T: Send> Drop for ModuleRef<T>{
         fn drop(&mut self) {
-            self.meta_queue.send(WorkerMsg::RemoveModule(self.uuid));
+        //    self.meta_queue.send(WorkerMsg::RemoveModule(self.uuid)).unwrap_or(());
         }
     }
     impl<T: Send> fmt::Debug for ModuleRef<T> {
@@ -690,7 +800,7 @@ pub mod executors_public {
     impl<T: Send> Clone for ModuleRef<T> {
         fn clone(&self) -> Self {
             ModuleRef{
-                uuid: self.uuid,
+                //uuid: self.uuid,
                 module: self.module.clone(),
                 meta_queue: self.meta_queue.clone(),
             }
@@ -699,7 +809,7 @@ pub mod executors_public {
 }
 
 pub mod system_setup_public {
-    use crate::{Configuration, ModuleRef, ReliableBroadcast, StubbornBroadcast, System, build_stubborn_broadcast, build_reliable_broadcast, WorkerMsg};
+    use crate::{Configuration, ModuleRef, ReliableBroadcast, StubbornBroadcast, System, build_stubborn_broadcast, build_reliable_broadcast};
 
     pub fn setup_system(
         system: &mut System,
