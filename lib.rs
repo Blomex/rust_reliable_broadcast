@@ -463,11 +463,11 @@ pub mod executors_public {
     use std::time::{Duration, Instant};
     use crossbeam_channel::{unbounded, Receiver, Sender};
     use crate::{ClosureMsg};
-    use std::sync::{Arc, Mutex, Condvar};
+    use std::sync::{Arc, Mutex, Condvar, Weak};
     use std::ops::{DerefMut};
     use std::thread::{JoinHandle};
     use uuid::Uuid;
-    use std::collections::{BinaryHeap};
+    use std::collections::{BinaryHeap, HashMap};
     use std::cmp::{Ordering};
     use std::panic::catch_unwind;
 
@@ -498,7 +498,7 @@ pub mod executors_public {
       //  uuid: Uuid,
         next_time: Duration,
         tick_duration: Duration,
-        tick_ref: Arc<Mutex<dyn std::marker::Send + Handler<Tick>>>,
+        tick_ref: Weak<Mutex<dyn std::marker::Send + Handler<Tick>>>,
     }
     impl Ord for Ticker{
         fn cmp(&self, other: &Self) -> Ordering {
@@ -511,7 +511,7 @@ pub mod executors_public {
         fn eq(&self, other: &Self) -> bool {
             self.next_time == other.next_time &&
                 self.tick_duration == other.tick_duration &&
-                Arc::ptr_eq(&self.tick_ref, &other.tick_ref)
+                Weak::ptr_eq(&self.tick_ref, &other.tick_ref)
         }
     }
     impl PartialOrd for Ticker{
@@ -520,7 +520,7 @@ pub mod executors_public {
         }
     }
     pub(crate) enum WorkerMsg {
-        NewModule(Uuid),
+        NewModule(Uuid, Arc<Mutex<dyn Send + 'static>>),
         /// When all references to a module are dropped, the module ought to be
         /// removed too. Otherwise, there is a possibility of a memory leak.
         RemoveModule(Uuid),
@@ -538,8 +538,7 @@ pub mod executors_public {
             let current_time = Instant::now();
             let ticker = Ticker{
              //  uuid: requester.uuid,
-                //TODO unwrap
-                tick_ref: requester.module.clone().unwrap(),
+                tick_ref: requester.module.clone(),
                 tick_duration: delay,
                 next_time: current_time.duration_since(self.starting_time) + delay,
             };
@@ -550,10 +549,11 @@ pub mod executors_public {
 
         pub fn register_module<T: Send + 'static>(&mut self, module: T) -> ModuleRef<T> {
             let uuid = Uuid::new_v4();
-            self.meta_tx.send(WorkerMsg::NewModule(uuid)).unwrap_or(());
+            let module_ptr = Arc::new(Mutex::new(module));
+            self.meta_tx.send(WorkerMsg::NewModule(uuid, module_ptr.clone())).unwrap_or(());
             ModuleRef{
                     // uuid,
-                    module: Some(Arc::new(Mutex::new(module))),
+                    module: Arc::downgrade(&module_ptr),
                     meta_queue: self.meta_tx.clone(),
                 }
         }
@@ -710,7 +710,8 @@ pub mod executors_public {
                         println!("picking mutex");
                         println!("Tick requested! {:#?} {:#?}", first_module.next_time, first_module.tick_duration);
                         let result = catch_unwind( ||{
-                            let mut module_mutex = first_module.tick_ref.lock().unwrap();
+                            let arc = first_module.tick_ref.upgrade().unwrap();
+                            let mut module_mutex = arc.lock().unwrap();
                             let module_handler = module_mutex.deref_mut();
                             module_handler.handle(Tick {});
                             drop(module_mutex);
@@ -726,10 +727,12 @@ pub mod executors_public {
 
                 }).unwrap()),
                 executor: Option::from(thread::Builder::new().name("executor".to_string()).spawn(move || {
+                    let mut modules = HashMap::new();
                     while let Ok(msg) = meta_rx.recv(){
                         match msg{
-                            WorkerMsg::NewModule(uuid) => {
+                            WorkerMsg::NewModule(uuid, module) => {
                                 println!("new module {}", uuid);
+                                modules.insert(uuid, module);
                                 // cloned_modules.insert(uuid);
                             },
                             WorkerMsg::RemoveModule(_uuid) =>{
@@ -779,7 +782,7 @@ pub mod executors_public {
 
     pub struct ModuleRef<T: Send + 'static> {
        // uuid: Uuid,
-        module : Option<Arc<Mutex<T>>>,
+        module : Weak<Mutex<T>>,
         meta_queue: Sender<WorkerMsg>,
     }
 
@@ -788,14 +791,14 @@ pub mod executors_public {
         where
             T: Send + Handler<M>,
         {
-            let maybe_mod_ref = self.module.clone();
+            let mod_ref = self.module.clone();
             self.meta_queue
                 .send(WorkerMsg::ExecuteModule(
                     Box::new(move || {
-                        match &maybe_mod_ref{
-                            Some(mod_ref) =>{
-                            let mut lock = mod_ref.lock().unwrap();
-                            lock.deref_mut().handle(msg.clone());
+                        match mod_ref.upgrade() {
+                            Some(lock) => {
+                                let mut  guard = lock.lock().unwrap();
+                                guard.deref_mut().handle(msg.clone());
                             }
                             None => return,
                         }
