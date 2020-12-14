@@ -537,7 +537,6 @@ pub mod executors_public {
             let dummy_ticker = tick_mutex.deref_mut();
             let current_time = Instant::now();
             let ticker = Ticker{
-             //  uuid: requester.uuid,
                 tick_ref: requester.module.clone(),
                 tick_duration: delay,
                 next_time: current_time.duration_since(self.starting_time) + delay,
@@ -552,7 +551,8 @@ pub mod executors_public {
             let module_ptr = Arc::new(Mutex::new(module));
             self.meta_tx.send(WorkerMsg::NewModule(uuid, module_ptr.clone())).unwrap_or(());
             ModuleRef{
-                    // uuid,
+                    ref_counter: Arc::new(Mutex::new(1)),
+                    uuid,
                     module: Arc::downgrade(&module_ptr),
                     meta_queue: self.meta_tx.clone(),
                 }
@@ -781,9 +781,10 @@ pub mod executors_public {
     }
 
     pub struct ModuleRef<T: Send + 'static> {
-       // uuid: Uuid,
+        uuid: Uuid,
         module : Weak<Mutex<T>>,
         meta_queue: Sender<WorkerMsg>,
+        ref_counter: Arc<Mutex<i32>>
     }
 
     impl<T: Send> ModuleRef<T> {
@@ -807,7 +808,12 @@ pub mod executors_public {
     }
     impl<T: Send> Drop for ModuleRef<T>{
         fn drop(&mut self) {
-        //    self.meta_queue.send(WorkerMsg::RemoveModule(self.uuid)).unwrap_or(());
+            let mut lock = self.ref_counter.lock().unwrap();
+            let value = lock.deref_mut();
+            *value -=1;
+            if *value == 0 {
+                self.meta_queue.send(WorkerMsg::RemoveModule(self.uuid)).unwrap_or(());
+            }
         }
     }
     impl<T: Send> fmt::Debug for ModuleRef<T> {
@@ -817,8 +823,14 @@ pub mod executors_public {
     }
     impl<T: Send> Clone for ModuleRef<T> {
         fn clone(&self) -> Self {
+            //increase ref count
+            let mut lock = self.ref_counter.lock().unwrap();
+            let value = lock.deref_mut();
+            *value +=1;
+            drop(lock);
             ModuleRef{
-                //uuid: self.uuid,
+                ref_counter: self.ref_counter.clone(),
+                uuid: self.uuid,
                 module: self.module.clone(),
                 meta_queue: self.meta_queue.clone(),
             }
