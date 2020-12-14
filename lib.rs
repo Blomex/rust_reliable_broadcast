@@ -41,9 +41,10 @@ pub mod broadcast_public {
             let message = MyReliableBroadcast::decode_system_broadcast_message(
                 storage.get(&currently_analyzed).unwrap().as_slice());
             let header = message.message.header;
-            pending.insert(header, message);
+            pending.insert(header, message.clone());
             counter +=1;
             currently_analyzed = "pending".to_owned() + &counter.to_string();
+            println!("Retrieved pending message {:#?}", message)
         }
 
         //retrieve 'delivered'
@@ -52,9 +53,10 @@ pub mod broadcast_public {
         currently_analyzed = "delivered".to_owned() + &delivered_counter.to_string();
         while storage.get(&currently_analyzed).is_some(){
             let delivered_msg = MyReliableBroadcast::decode_header(storage.get(&currently_analyzed).unwrap().as_slice());
-            delivered.insert(delivered_msg);
+            delivered.insert(delivered_msg.clone());
             delivered_counter +=1;
             currently_analyzed = "delivered".to_owned() + &delivered_counter.to_string();
+            println!("Retrieved delivered message: {:#?} ", delivered_msg);
         }
         //retrieve 'acks'
         let mut ack = HashMap::new();
@@ -71,7 +73,7 @@ pub mod broadcast_public {
             currently_analyzed = "ack".to_owned() + &ack_counter.to_string();
         }
 
-        Box::new(MyReliableBroadcast{
+        let result = Box::new(MyReliableBroadcast{
             sbeb,
             id,
             processes_number,
@@ -83,7 +85,11 @@ pub mod broadcast_public {
             counter,
             delivered_counter,
             ack_counter,
-        })
+        });
+        for (_k , v) in result.pending.clone(){
+            result.sbeb.send(v);
+        }
+        result
     }
 
     struct MyReliableBroadcast{
@@ -109,11 +115,6 @@ pub mod broadcast_public {
         fn parse_system_message_content(msg: SystemMessageContent) ->Vec<u8>{
             msg.msg
         }
-        // fn parse_system_ack_message(ack_msg: SystemAcknowledgmentMessage) -> Vec<u8>{
-        //     let parsed_header = MyReliableBroadcast::parse_header(ack_msg.hdr);
-        //     let parse_sender_uuid = ack_msg.proc.as_bytes().to_vec();
-        //     [parse_sender_uuid, parsed_header].concat()
-        // }
         fn parse_system_message(msg: SystemMessage) -> Vec<u8>{
             let header = MyReliableBroadcast::parse_header(msg.header);
             let content = MyReliableBroadcast::parse_system_message_content(msg.data);
@@ -458,17 +459,17 @@ pub mod stable_storage_public {
 }
 
 pub mod executors_public {
-    use std::{fmt};
+    use std::{fmt, thread};
     use std::time::{Duration, Instant};
     use crossbeam_channel::{unbounded, Receiver, Sender};
     use crate::{ClosureMsg};
     use std::sync::{Arc, Mutex, Condvar};
-    use std::ops::{DerefMut, Deref};
-    use std::thread::{JoinHandle, spawn};
+    use std::ops::{DerefMut};
+    use std::thread::{JoinHandle};
     use uuid::Uuid;
     use std::collections::{BinaryHeap};
     use std::cmp::{Ordering};
-    use std::sync::atomic::AtomicBool;
+    use std::panic::catch_unwind;
 
     pub trait Message: fmt::Debug + Clone + Send + 'static {}
     impl<T: fmt::Debug + Clone + Send + 'static> Message for T {}
@@ -523,6 +524,8 @@ pub mod executors_public {
         /// When all references to a module are dropped, the module ought to be
         /// removed too. Otherwise, there is a possibility of a memory leak.
         RemoveModule(Uuid),
+
+        ///message sent to executor thread to inform him that he is supposed to finish
         ExecutionDone,
         /// This message could be used to notify the system, that there is a message
         /// to be deliver to the specified module.
@@ -535,7 +538,8 @@ pub mod executors_public {
             let current_time = Instant::now();
             let ticker = Ticker{
              //  uuid: requester.uuid,
-                tick_ref: requester.module.clone(),
+                //TODO unwrap
+                tick_ref: requester.module.clone().unwrap(),
                 tick_duration: delay,
                 next_time: current_time.duration_since(self.starting_time) + delay,
             };
@@ -549,7 +553,7 @@ pub mod executors_public {
             self.meta_tx.send(WorkerMsg::NewModule(uuid)).unwrap_or(());
             ModuleRef{
                     // uuid,
-                    module: Arc::new(Mutex::new(module)),
+                    module: Some(Arc::new(Mutex::new(module))),
                     meta_queue: self.meta_tx.clone(),
                 }
         }
@@ -663,9 +667,9 @@ pub mod executors_public {
             }));*/
 
             System{
-                tick: Option::from(spawn(move || {
+                tick: Option::from(thread::Builder::new().name("ticker".to_string()).spawn(move || {
                     let done = cloned_done.clone();
-                    let mut time = Duration::from_secs(1);
+                    let mut time = Duration::from_secs(0);
                     let predicate = Box::new(|var: &mut BinaryHeap<Ticker>, time: &mut Duration|{
                         if !var.is_empty() {
                             let current_time = Instant::now();
@@ -703,18 +707,25 @@ pub mod executors_public {
                         let ticker = guard.deref_mut();
                         let mut first_module = ticker.pop().unwrap();
                         //Trying to pick up module mutex
-                        let mut module_mutex = first_module.tick_ref.lock().unwrap();
-                        let module_handler = module_mutex.deref_mut();
+                        println!("picking mutex");
                         println!("Tick requested! {:#?} {:#?}", first_module.next_time, first_module.tick_duration);
-                        module_handler.handle(Tick {});
-                        drop(module_mutex);
+                        let result = catch_unwind( ||{
+                            let mut module_mutex = first_module.tick_ref.lock().unwrap();
+                            let module_handler = module_mutex.deref_mut();
+                            module_handler.handle(Tick {});
+                            drop(module_mutex);
+                        });
+                        println!("request done");
+                        //drop(module_mutex);
                         first_module.next_time += first_module.tick_duration;
-                        ticker.push(first_module);
+                        if result.is_ok() {
+                            ticker.push(first_module);
+                        }
                         drop(guard);
                     }
 
-                })),
-                executor: Option::from(spawn(move || {
+                }).unwrap()),
+                executor: Option::from(thread::Builder::new().name("executor".to_string()).spawn(move || {
                     while let Ok(msg) = meta_rx.recv(){
                         match msg{
                             WorkerMsg::NewModule(uuid) => {
@@ -744,12 +755,10 @@ pub mod executors_public {
                             },
                             _ => return,
                         }
-                        println!("after msg");
-
                     }
                     print!("executor thread exiting..\n");
-                })),
-                tick_handler: Arc::new((Mutex::new(Default::default()), Default::default())),
+                }).unwrap()),
+                tick_handler: tick_handler,
                 meta_tx,
                 starting_time: now_timer,
                 done: done
@@ -761,7 +770,8 @@ pub mod executors_public {
             println!("Trying to get done mutex");
             *self.done.lock().unwrap().deref_mut() = true;
             println!("Telling all threads to end");
-            self.meta_tx.send(WorkerMsg::ExecutionDone);
+            self.tick_handler.1.notify_all();
+            self.meta_tx.send(WorkerMsg::ExecutionDone).unwrap_or(());
             self.tick.take().unwrap().join().unwrap_or(());
             self.executor.take().unwrap().join().unwrap_or(());
         }
@@ -769,7 +779,7 @@ pub mod executors_public {
 
     pub struct ModuleRef<T: Send + 'static> {
        // uuid: Uuid,
-        module : Arc<Mutex<T>>,
+        module : Option<Arc<Mutex<T>>>,
         meta_queue: Sender<WorkerMsg>,
     }
 
@@ -778,12 +788,17 @@ pub mod executors_public {
         where
             T: Send + Handler<M>,
         {
-            let mod_ref = self.module.clone();
+            let maybe_mod_ref = self.module.clone();
             self.meta_queue
                 .send(WorkerMsg::ExecuteModule(
                     Box::new(move || {
-                        let mut lock = mod_ref.lock().unwrap();
-                        lock.deref_mut().handle(msg.clone());
+                        match &maybe_mod_ref{
+                            Some(mod_ref) =>{
+                            let mut lock = mod_ref.lock().unwrap();
+                            lock.deref_mut().handle(msg.clone());
+                            }
+                            None => return,
+                        }
                     }))).ok();
         }
     }
