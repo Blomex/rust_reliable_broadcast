@@ -1,20 +1,20 @@
 # rust_reliable_broadcast
 
-Background
+## Background
 Reliable broadcast is mostly a technical algorithm to provide higher-level meaningful abstractions. Because of this, the description will be rather dry. Nevertheless, it is a reasonably simple and important distributed algorithm. Your task is to implement the executor system and then use it to implement a variant of the reliable broadcast.
 
 Your solution must implement a public interface from the attached template to provide a fault tolerant reliable broadcast facility. The solution should take the form of a library. You are allowed to change layout of files in the template, but you are not allowed to modify the public interface of the library.
 
-Problem description
-Overview
+## Problem description
+### Overview
 There is a fixed number of equivalent (instances of the same software) processes, knowing of each other. At any time, the processes may want to broadcast a message—requests to do so will arrive externally to your software. The processes can crash, and are expected to be able to recover from these crashes—we assume the fail-recovery model. We assume also that majority of the processes must be up and running for the system to function. In other words, we expect system to make progress in message delivery whenever more than half of the processes are up.
 
-Crashes
+## Crashes
 Individual processes can crash and recover, which means stable storage is necessary. In a configuration (see template/lib.rs) you are provided with a stable storage abstraction represented by a trait StableStorage. You can assume that every process has a unique stable storage and that it is indeed reliable.
 
 The stable storage is provided conceptually as a key-value store, with a limitation that no key can be longer than 255 bytes, and stored values must have less than 65536 bytes. Implementing such stable storage backed by a directory on a filesystem is a part of your task.
 
-Solution interface
+## Solution interface
 Now we introduce the interface of your solution. It is provided in template/lib.rs and you cannot modify it, or your solution will not build correctly against tests. By the interface, we mean here only publicly exported symbols from the library crate.
 
 Your task is to provide a rust library crate based on the provided template. The main method is function setup_system from template/lib.rs, which is responsible for setting up your reliable broadcast solution and creating, among others modules you will need, the one implementing ReliableBroadcast trait (see template/lib.rs). All communication from the outside world will be done via a reference to ReliableBroadcastModule (template/lib.rs) which must be returned from the setup_system method. This module must implement the main algorithm (its description is provided below). Your modules must be created in System (the struct defined in template/lib.rs) which is provided as an argument to setup_system. System is described in more details closer to the end of the document. Note that every reliable broadcast process will have its own System object, and that such broadcast processes can run on different physical machines.
@@ -35,9 +35,9 @@ callback to call when reliable broadcast decides it is safe to deliver a message
 
 As for technical build details, you can use only crates listed in Cargo.toml in template as the main dependencies. You can use anything you want for the [dev-dependencies] section, as it will be ignored by tests. You can specify any number of binaries in your Cargo.toml, as those also will be ignored by tests. You must not use [build-dependencies].
 
-Logged Majority Ack uniform reliable broadcast
+## Logged Majority Ack uniform reliable broadcast
 You are provided here with the dry description of the algorithm from the lecture. Plus denotes set sum, and empty means an empty set, N is the total number of process:
-
+```
 Implements:
     LoggedUniformReliableBroadcast, instance lurb.
 
@@ -84,6 +84,7 @@ upon event < sbeb Broadcast | m > do
 
 upon event < sl, Deliver | p, m > do
     trigger < sbeb, Deliver | p, m >;
+```
 StubbornPointToPointLinks is a plain link that takes care of retransmissions of a message until the recipient acknowledges receiving it. In your solution use PlainSender (template/lib.rs) which is a faulty link (it can lose and duplicate messages, but it cannot corrupt them). PlainSender can send two types of messages: Acknowledge that a message was received, and Broadcast messages to other processes.
 
 Details of message handlers were covered in the lectures, your solution must implement them in the way specified above. For the reliable broadcast, we do not distinguish between Init and Recovery—your system must always "boot" from the stable storage.
@@ -132,7 +133,7 @@ The simple executor system allows for creation of modules of an arbitrary type t
 A deviation from the standard event-driven shared-nothing architecture is a usage of multiple buffers: to allow typesafe code, we will use multiple buffers. In fact, every module has its own message buffer, and the executor is notified when there is a new message ready to be processed by a particular module.
 
 This way the modules can be owned by one thread which awaits on a channel for meta operations to execute:
-
+```rust
 enum WorkerMsg {
     NewModule,
     /// When all references to a module are dropped, the module ought to be
@@ -142,14 +143,16 @@ enum WorkerMsg {
     /// to be deliver to the specified module.
     ExecuteModule,
 }
+```
 Multi-type executor system
 Let us now consider the only message type that can be received by a module from the simple executor system (the on described above). If one chooses a closure as this type, then it is possible to move messages of any type into such closure:
-
+```rust
 fn sample<T, M>(msg: M) {
     let _closure_message = move |module: &mut T| {
         module.handle(msg);
     };
 }
+```
 The appropriate handle method is resolved by using type bounds—that what the Handler trait is necessary for.
 
 This concludes our brief description of the required executor system.
